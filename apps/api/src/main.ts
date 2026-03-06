@@ -2,11 +2,12 @@ import 'dotenv/config';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { z } from 'zod';
-import { store, writeAuditLog } from './store.js';
-import type { Approval, CapabilityFlags, Draft, PublishedPost, ScheduledPost } from './types.js';
+import { createRepository } from './repository.js';
+import type { CapabilityFlags, ScheduledPost } from './types.js';
 
 const app = Fastify({ logger: true });
 const PORT = Number(process.env.APP_PORT ?? 4000);
+const repo = await createRepository();
 
 await app.register(cors, { origin: true });
 
@@ -60,21 +61,13 @@ function defaultCapabilities(): CapabilityFlags {
   };
 }
 
-function publishScheduledPost(scheduledPost: ScheduledPost): PublishedPost {
-  scheduledPost.state = 'PUBLISHING';
+async function publishScheduledPost(scheduledPost: ScheduledPost) {
+  await repo.updateScheduledPostState(scheduledPost.id, 'PUBLISHING');
 
-  const publishedPost: PublishedPost = {
-    id: crypto.randomUUID(),
-    workspaceId: scheduledPost.workspaceId,
-    scheduledPostId: scheduledPost.id,
-    linkedinPostUrn: `urn:li:share:${Date.now()}`,
-    publishedAt: new Date().toISOString(),
-  };
+  const publishedPost = await repo.createPublishedPost(scheduledPost.workspaceId, scheduledPost.id);
+  await repo.updateScheduledPostState(scheduledPost.id, 'PUBLISHED');
 
-  store.publishedPosts.push(publishedPost);
-  scheduledPost.state = 'PUBLISHED';
-
-  writeAuditLog({
+  await repo.writeAuditLog({
     workspaceId: scheduledPost.workspaceId,
     actorType: 'system',
     action: 'post.published',
@@ -85,30 +78,20 @@ function publishScheduledPost(scheduledPost: ScheduledPost): PublishedPost {
   return publishedPost;
 }
 
-function createApproval(workspaceId: string, scheduledPostId: string): Approval {
-  const approval: Approval = {
-    id: crypto.randomUUID(),
-    workspaceId,
-    actionType: 'linkedin.publish_post',
-    actionPayload: { scheduledPostId },
-    status: 'PENDING',
-    requestedBySystemAt: new Date().toISOString(),
-  };
-
-  store.approvals.push(approval);
-
-  writeAuditLog({
+async function createApproval(workspaceId: string, scheduledPostId: string) {
+  const approval = await repo.createApproval(workspaceId, scheduledPostId);
+  await repo.writeAuditLog({
     workspaceId,
     actorType: 'system',
     action: 'approval.requested',
     entityType: 'approval',
     entityId: approval.id,
   });
-
   return approval;
 }
 
 app.get('/v1/internal/health', async () => ({ status: 'ok', service: 'api' }));
+app.get('/v1/internal/storage', async () => ({ driver: repo.driver }));
 
 app.get('/v1/auth/me', async () => ({
   user: {
@@ -123,24 +106,20 @@ app.post('/v1/linkedin/accounts/connect', async (req, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
 
   const body = parsed.data;
-  const existing = store.linkedInAccounts.find(
-    (a) => a.workspaceId === body.workspaceId && a.linkedinMemberId === body.linkedinMemberId,
+  const existing = (await repo.getLinkedInAccounts(body.workspaceId)).find(
+    (a) => a.linkedinMemberId === body.linkedinMemberId,
   );
   if (existing) return reply.code(409).send({ error: 'LinkedIn account already connected' });
 
-  const account = {
-    id: crypto.randomUUID(),
+  const account = await repo.createLinkedInAccount({
     workspaceId: body.workspaceId,
     linkedinMemberId: body.linkedinMemberId,
     displayName: body.displayName,
-    connectionStatus: 'ACTIVE' as const,
     scopes: body.scopes,
     capabilities: body.capabilities ?? defaultCapabilities(),
-    createdAt: new Date().toISOString(),
-  };
+  });
 
-  store.linkedInAccounts.push(account);
-  writeAuditLog({
+  await repo.writeAuditLog({
     workspaceId: account.workspaceId,
     actorType: 'user',
     action: 'linkedin.account.connected',
@@ -153,16 +132,12 @@ app.post('/v1/linkedin/accounts/connect', async (req, reply) => {
 
 app.get('/v1/linkedin/accounts', async (req) => {
   const { workspaceId } = req.query as { workspaceId?: string };
-  return {
-    accounts: workspaceId
-      ? store.linkedInAccounts.filter((a) => a.workspaceId === workspaceId)
-      : store.linkedInAccounts,
-  };
+  return { accounts: await repo.getLinkedInAccounts(workspaceId) };
 });
 
 app.get('/v1/linkedin/accounts/:id/capabilities', async (req, reply) => {
   const { id } = req.params as { id: string };
-  const account = store.linkedInAccounts.find((a) => a.id === id);
+  const account = await repo.getLinkedInAccountById(id);
   if (!account) return reply.code(404).send({ error: 'LinkedIn account not found' });
   return { accountId: account.id, capabilities: account.capabilities };
 });
@@ -171,14 +146,9 @@ app.post('/v1/posts/drafts', async (req, reply) => {
   const parsed = draftSchema.safeParse(req.body);
   if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
 
-  const draft: Draft = {
-    id: crypto.randomUUID(),
-    createdAt: new Date().toISOString(),
-    ...parsed.data,
-  };
+  const draft = await repo.createDraft(parsed.data);
 
-  store.drafts.push(draft);
-  writeAuditLog({
+  await repo.writeAuditLog({
     workspaceId: draft.workspaceId,
     actorType: 'user',
     actorId: draft.authorUserId,
@@ -192,9 +162,7 @@ app.post('/v1/posts/drafts', async (req, reply) => {
 
 app.get('/v1/posts/drafts', async (req) => {
   const { workspaceId } = req.query as { workspaceId?: string };
-  return {
-    drafts: workspaceId ? store.drafts.filter((d) => d.workspaceId === workspaceId) : store.drafts,
-  };
+  return { drafts: await repo.getDrafts(workspaceId) };
 });
 
 app.post('/v1/posts/scheduled', async (req, reply) => {
@@ -202,24 +170,17 @@ app.post('/v1/posts/scheduled', async (req, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
 
   const body = parsed.data;
-  const draft = store.drafts.find((d) => d.id === body.draftId && d.workspaceId === body.workspaceId);
+  const draft = await repo.getDraftById(body.workspaceId, body.draftId);
   if (!draft) return reply.code(404).send({ error: 'Draft not found' });
 
-  const account = store.linkedInAccounts.find(
-    (a) => a.id === body.linkedInAccountId && a.workspaceId === body.workspaceId,
-  );
-  if (!account) return reply.code(404).send({ error: 'LinkedIn account not found' });
+  const account = await repo.getLinkedInAccountById(body.linkedInAccountId);
+  if (!account || account.workspaceId !== body.workspaceId) {
+    return reply.code(404).send({ error: 'LinkedIn account not found' });
+  }
 
-  const scheduledPost: ScheduledPost = {
-    id: crypto.randomUUID(),
-    idempotencyKey: `publish:${body.draftId}:${body.scheduledFor}`,
-    state: 'PENDING',
-    createdAt: new Date().toISOString(),
-    ...body,
-  };
+  const scheduledPost = await repo.createScheduledPost(body);
 
-  store.scheduledPosts.push(scheduledPost);
-  writeAuditLog({
+  await repo.writeAuditLog({
     workspaceId: scheduledPost.workspaceId,
     actorType: 'user',
     action: 'scheduled_post.created',
@@ -232,18 +193,11 @@ app.post('/v1/posts/scheduled', async (req, reply) => {
 
 app.get('/v1/posts/calendar', async (req) => {
   const { workspaceId } = req.query as { workspaceId?: string };
-  return {
-    scheduledPosts: workspaceId
-      ? store.scheduledPosts.filter((p) => p.workspaceId === workspaceId)
-      : store.scheduledPosts,
-  };
+  return { scheduledPosts: await repo.getScheduledPosts(workspaceId) };
 });
 
-app.post('/v1/internal/scheduler/dispatch-due', async (req) => {
-  const now = new Date();
-  const duePosts = store.scheduledPosts.filter(
-    (p) => (p.state === 'PENDING' || p.state === 'APPROVED') && new Date(p.scheduledFor) <= now,
-  );
+app.post('/v1/internal/scheduler/dispatch-due', async () => {
+  const duePosts = await repo.findDueScheduledPosts(new Date().toISOString());
 
   const summary = {
     dueCount: duePosts.length,
@@ -252,9 +206,9 @@ app.post('/v1/internal/scheduler/dispatch-due', async (req) => {
   };
 
   for (const post of duePosts) {
-    const account = store.linkedInAccounts.find((a) => a.id === post.linkedInAccountId);
+    const account = await repo.getLinkedInAccountById(post.linkedInAccountId);
     if (!account) {
-      post.state = 'FAILED';
+      await repo.updateScheduledPostState(post.id, 'FAILED');
       continue;
     }
 
@@ -264,13 +218,13 @@ app.post('/v1/internal/scheduler/dispatch-due', async (req) => {
       !account.capabilities.canPublishPosts;
 
     if (forceApproval && post.state !== 'APPROVED') {
-      post.state = 'AWAITING_APPROVAL';
-      createApproval(post.workspaceId, post.id);
+      await repo.updateScheduledPostState(post.id, 'AWAITING_APPROVAL');
+      await createApproval(post.workspaceId, post.id);
       summary.createdApprovals += 1;
       continue;
     }
 
-    publishScheduledPost(post);
+    await publishScheduledPost(post);
     summary.publishedCount += 1;
   }
 
@@ -279,13 +233,7 @@ app.post('/v1/internal/scheduler/dispatch-due', async (req) => {
 
 app.get('/v1/approvals', async (req) => {
   const query = req.query as { workspaceId?: string; status?: 'PENDING' | 'APPROVED' | 'REJECTED' };
-  return {
-    approvals: store.approvals.filter((a) => {
-      if (query.workspaceId && a.workspaceId !== query.workspaceId) return false;
-      if (query.status && a.status !== query.status) return false;
-      return true;
-    }),
-  };
+  return { approvals: await repo.getApprovals(query.workspaceId, query.status) };
 });
 
 app.post('/v1/approvals/:id/approve', async (req, reply) => {
@@ -293,30 +241,29 @@ app.post('/v1/approvals/:id/approve', async (req, reply) => {
   const parsed = approvalDecisionSchema.safeParse(req.body);
   if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
 
-  const approval = store.approvals.find((a) => a.id === id);
+  const approval = await repo.getApprovalById(id);
   if (!approval) return reply.code(404).send({ error: 'Approval not found' });
   if (approval.status !== 'PENDING') return reply.code(409).send({ error: 'Approval already decided' });
 
-  approval.status = 'APPROVED';
-  approval.decidedByUserId = parsed.data.decidedByUserId;
-  approval.decidedAt = new Date().toISOString();
+  const decided = await repo.updateApprovalDecision(id, 'APPROVED', parsed.data.decidedByUserId);
+  if (!decided) return reply.code(500).send({ error: 'Failed to update approval' });
 
-  const scheduledPost = store.scheduledPosts.find((p) => p.id === approval.actionPayload.scheduledPostId);
+  const scheduledPost = (await repo.getScheduledPosts()).find((p) => p.id === approval.actionPayload.scheduledPostId);
   if (!scheduledPost) return reply.code(404).send({ error: 'Scheduled post not found for approval' });
 
-  scheduledPost.state = 'APPROVED';
-  const publishedPost = publishScheduledPost(scheduledPost);
+  await repo.updateScheduledPostState(scheduledPost.id, 'APPROVED');
+  const publishedPost = await publishScheduledPost({ ...scheduledPost, state: 'APPROVED' });
 
-  writeAuditLog({
+  await repo.writeAuditLog({
     workspaceId: approval.workspaceId,
     actorType: 'user',
-    actorId: approval.decidedByUserId,
+    actorId: parsed.data.decidedByUserId,
     action: 'approval.approved',
     entityType: 'approval',
     entityId: approval.id,
   });
 
-  return { approval, publishedPost };
+  return { approval: decided, publishedPost };
 });
 
 app.post('/v1/approvals/:id/reject', async (req, reply) => {
@@ -324,45 +271,37 @@ app.post('/v1/approvals/:id/reject', async (req, reply) => {
   const parsed = approvalDecisionSchema.safeParse(req.body);
   if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
 
-  const approval = store.approvals.find((a) => a.id === id);
+  const approval = await repo.getApprovalById(id);
   if (!approval) return reply.code(404).send({ error: 'Approval not found' });
   if (approval.status !== 'PENDING') return reply.code(409).send({ error: 'Approval already decided' });
 
-  approval.status = 'REJECTED';
-  approval.decidedByUserId = parsed.data.decidedByUserId;
-  approval.decidedAt = new Date().toISOString();
+  const decided = await repo.updateApprovalDecision(id, 'REJECTED', parsed.data.decidedByUserId);
+  if (!decided) return reply.code(500).send({ error: 'Failed to update approval' });
 
-  const scheduledPost = store.scheduledPosts.find((p) => p.id === approval.actionPayload.scheduledPostId);
-  if (scheduledPost) scheduledPost.state = 'CANCELED';
+  await repo.updateScheduledPostState(approval.actionPayload.scheduledPostId, 'CANCELED');
 
-  writeAuditLog({
+  await repo.writeAuditLog({
     workspaceId: approval.workspaceId,
     actorType: 'user',
-    actorId: approval.decidedByUserId,
+    actorId: parsed.data.decidedByUserId,
     action: 'approval.rejected',
     entityType: 'approval',
     entityId: approval.id,
   });
 
-  return { approval };
+  return { approval: decided };
 });
 
 app.get('/v1/posts/published', async (req) => {
   const { workspaceId } = req.query as { workspaceId?: string };
-  return {
-    publishedPosts: workspaceId
-      ? store.publishedPosts.filter((p) => p.workspaceId === workspaceId)
-      : store.publishedPosts,
-  };
+  return { publishedPosts: await repo.getPublishedPosts(workspaceId) };
 });
 
 app.get('/v1/audit-logs', async (req) => {
   const { workspaceId } = req.query as { workspaceId?: string };
-  return {
-    auditLogs: workspaceId ? store.auditLogs.filter((a) => a.workspaceId === workspaceId) : store.auditLogs,
-  };
+  return { auditLogs: await repo.getAuditLogs(workspaceId) };
 });
 
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
-  app.log.info(`API running on :${PORT}`);
+  app.log.info(`API running on :${PORT} (storage=${repo.driver})`);
 });
