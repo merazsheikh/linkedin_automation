@@ -1,0 +1,163 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TeamRole {
+  OWNER
+  ADMIN
+  EDITOR
+  REVIEWER
+  VIEWER
+}
+
+enum LinkedInConnectionStatus {
+  ACTIVE
+  REAUTH_REQUIRED
+  REVOKED
+  ERROR
+}
+
+enum ScheduledPostState {
+  PENDING
+  AWAITING_APPROVAL
+  APPROVED
+  PUBLISHING
+  PUBLISHED
+  FAILED
+  CANCELED
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+model User {
+  id          String      @id @default(uuid())
+  email       String      @unique
+  name        String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  teamMembers TeamMember[]
+}
+
+model Workspace {
+  id               String            @id @default(uuid())
+  name             String
+  timezone         String            @default("UTC")
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  teamMembers      TeamMember[]
+  linkedInAccounts LinkedInAccount[]
+  postDrafts       PostDraft[]
+  scheduledPosts   ScheduledPost[]
+  approvals        Approval[]
+  auditLogs        AuditLog[]
+}
+
+model TeamMember {
+  id          String    @id @default(uuid())
+  workspaceId String
+  userId      String
+  role        TeamRole
+  createdAt   DateTime  @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+}
+
+model LinkedInAccount {
+  id                     String                   @id @default(uuid())
+  workspaceId            String
+  linkedinMemberId       String
+  displayName            String
+  connectionStatus       LinkedInConnectionStatus @default(ACTIVE)
+  canPublishPosts        Boolean                  @default(false)
+  requiresManualPublish  Boolean                  @default(true)
+  createdAt              DateTime                 @default(now())
+  updatedAt              DateTime                 @updatedAt
+
+  workspace              Workspace                @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  oauthTokens            OauthToken[]
+  scheduledPosts         ScheduledPost[]
+
+  @@unique([workspaceId, linkedinMemberId])
+}
+
+model OauthToken {
+  id                String   @id @default(uuid())
+  linkedInAccountId String
+  accessTokenEnc    String
+  refreshTokenEnc   String?
+  expiresAt         DateTime
+  createdAt         DateTime @default(now())
+
+  linkedInAccount LinkedInAccount @relation(fields: [linkedInAccountId], references: [id], onDelete: Cascade)
+}
+
+model PostDraft {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  authorUserId   String
+  content        String
+  title          String?
+  createdAt      DateTime @default(now())
+
+  workspace      Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  scheduledPost  ScheduledPost?
+}
+
+model ScheduledPost {
+  id                String             @id @default(uuid())
+  workspaceId       String
+  draftId           String             @unique
+  linkedInAccountId String
+  scheduledFor      DateTime
+  policyMode        String             @default("approval")
+  state             ScheduledPostState @default(PENDING)
+  idempotencyKey    String?
+  createdAt         DateTime           @default(now())
+
+  workspace         Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  draft             PostDraft          @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  linkedInAccount   LinkedInAccount    @relation(fields: [linkedInAccountId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, scheduledFor])
+}
+
+model Approval {
+  id                String         @id @default(uuid())
+  workspaceId       String
+  actionType        String
+  actionPayloadJson Json
+  status            ApprovalStatus @default(PENDING)
+  createdAt         DateTime       @default(now())
+
+  workspace         Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, status])
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  workspaceId String
+  actorType   String
+  actorId     String?
+  action      String
+  entityType  String
+  entityId    String
+  createdAt   DateTime @default(now())
+
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, createdAt])
+}

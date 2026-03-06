@@ -1,0 +1,16 @@
+{
+  "name": "linkedin-automation-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w apps/api",
+    "dev:api": "npm run dev -w apps/api",
+    "dev:worker": "npm run dev -w apps/worker",
+    "build": "npm run build -w apps/api && npm run build -w apps/worker",
+    "typecheck": "npm run typecheck -w apps/api && npm run typecheck -w apps/worker"
+  }
+}
